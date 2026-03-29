@@ -1,0 +1,12 @@
+include:
+  - docker-compose.yml
+
+services:
+  backend:
+    env_file: ./infra/.env.test
+
+
+  frontend:
+    env_file: ./infra/.env.test
+
+

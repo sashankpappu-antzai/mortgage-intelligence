@@ -1,0 +1,53 @@
+[project]
+name = "mortgage-intelligence"
+version = "0.1.0"
+requires-python = ">=3.11"
+description = "AI-powered mortgage processing — eliminates the Processor role for conventional loans"
+
+dependencies = [
+  # Web framework (MIT)
+  "fastapi>=0.111",
+  "uvicorn[standard]>=0.30",
+  "python-multipart>=0.0.12",
+  # Validation & config (MIT)
+  "pydantic>=2.0",
+  "pydantic-settings>=2.0",
+  # Auth (MIT)
+  "PyJWT[crypto]>=2.8",
+  "python-jose[cryptography]>=3.3",
+  "passlib[bcrypt]>=1.7",
+  # Database (MIT / BSD)
+  "sqlalchemy[asyncio]>=2.0",
+  "asyncpg>=0.29",
+  "alembic>=1.14",
+  # HTTP client (BSD)
+  "httpx>=0.28",
+  # Cache & pub/sub (MIT)
+  "redis>=5.2",
+  # S3-compatible storage - MinIO (open-source) or any S3 provider (Apache 2.0)
+  "boto3>=1.35",
+  # AI agent orchestration (MIT)
+  "langgraph>=0.2",
+  "langchain>=0.2",
+  "langchain-core>=0.2",
+  # Observability - Langfuse (MIT, self-hosted)
+  "langfuse>=2.0",
+  # Anthropic Claude (optional cloud LLM)
+  "anthropic>=0.30",
+]
+
+[tool.uv]
+dev-dependencies = [
+  "pytest",
+  "pytest-asyncio",
+  "pytest-cov",
+  "httpx",
+  "ruff",
+  "deepeval>=1.0",
+]
+
+[tool.ruff]
+line-length = 100
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

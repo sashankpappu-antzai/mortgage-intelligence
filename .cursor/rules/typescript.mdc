@@ -1,0 +1,34 @@
+---
+description: TypeScript/Next.js coding rules for mortgage-intelligence
+globs: **/*.{ts,tsx}
+---
+
+# TypeScript Rules — mortgage-intelligence
+
+## Type Safety
+- `strict: true` is enabled — never use `any` unless unavoidable and annotated with a comment
+- Prefer `unknown` over `any` for untyped external data
+- Use `satisfies` operator for type-safe object literals
+- Export types and interfaces from a co-located `types.ts` when shared across files
+
+## React / Next.js
+- Use Next.js App Router (`app/` directory) — no Pages Router
+- Server Components by default — add `'use client'` only when needed
+- Use `next/image` for all images, `next/link` for all internal navigation
+- Data fetching in Server Components — avoid client-side fetch waterfalls
+- Use `loading.tsx` and `error.tsx` for async route segments
+
+## API Routes
+- Use Next.js Route Handlers (`app/api/.../route.ts`)
+- Always validate request bodies with Zod
+- Return typed `Response` objects
+
+## File Naming
+- Component files: `PascalCase.tsx`
+- Route files: Next.js conventions (`page.tsx`, `layout.tsx`, `route.ts`)
+- Utility files: `camelCase.ts`
+- Type definition files: `types.ts`
+
+## Environment Variables
+- Prefix client-accessible vars with `NEXT_PUBLIC_`
+- Never expose secrets to the client bundle

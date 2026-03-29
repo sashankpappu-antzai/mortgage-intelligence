@@ -1,0 +1,18 @@
+{
+  "project_name": "mortgage-intelligence",
+  "frontend": "nextjs",
+  "framework": "langchain",
+  "databases": [
+    "postgres"
+  ],
+  "llm_providers": [
+    "claude"
+  ],
+  "environments": [
+    "dev",
+    "test",
+    "prod"
+  ],
+  "use_deepeval": true,
+  "use_ngrok": true
+}

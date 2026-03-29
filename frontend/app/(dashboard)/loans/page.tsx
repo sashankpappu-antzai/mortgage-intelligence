@@ -9,7 +9,6 @@ export default function LoansPage() {
   const [loans, setLoans] = useState<LoanSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
-  const [showCreate, setShowCreate] = useState(false);
 
   useEffect(() => {
     loadLoans();

@@ -302,18 +302,122 @@ The system uses Encompass as the **system of record**. Our platform is an AI lay
 
 All webhooks verified via HMAC-SHA256 signature. OAuth2 tokens auto-refreshed. Rate limiting and retry logic built into the client.
 
-## Milestone Roadmap
+## Milestone Roadmap (Business-Process Driven)
 
-| # | Milestone | Status | What It Delivers |
-|---|-----------|--------|-----------------|
-| 1 | Foundation + Loan Intake | **Done** | Persona classification, dynamic checklist, Encompass webhooks |
-| 2 | Document Intelligence | Next | OCR + classify 25+ doc types + extract data + link to conditions |
-| 3 | Income Calculation | Planned | FNMA income calc for 5 persona paths + DTI + worksheets |
-| 4 | Asset & Employment | Planned | Bank stmt verification, VOE, gap detection, auto-LOE |
-| 5 | Credit + Third-Party | Planned | Credit analysis, appraisal/title/flood ordering, fee validation |
-| 6 | UW Dashboard + QC | Planned | Single-view dashboard, validation matrix, QC scorecard |
-| 7 | Closing + Borrower Portal | Planned | CD prep, borrower self-service, end-to-end lifecycle |
-| 8 | Production Hardening | Planned | Multi-tenant, load testing, security audit, SOC 2 |
+Each milestone delivers a complete business process end-to-end, testable through the UI. No milestone is "just backend" or "just infra" - every one includes the full flow from user action to visible result.
+
+### M1: Loan Intake & Borrower Onboarding (DONE)
+**Business Process**: LO creates a loan, system identifies the borrower type and tells them exactly what documents are needed.
+
+| E2E Test | Steps |
+|----------|-------|
+| LO creates W-2 borrower | Login as LO > New Loan > Enter borrower (employment: W-2) > Submit > Verify persona = "W-2 Salaried" > Verify checklist shows W-2s, pay stubs, VOE |
+| LO creates self-employed borrower | New Loan > Self-employed, 100% ownership > Submit > Verify persona = "Self-Employed" > Verify checklist shows business tax returns, P&L, K-1s |
+| Encompass webhook creates loan | POST webhook `loan.milestone.changed` > Verify loan appears in LO dashboard |
+| UW sees pipeline | Login as UW > Pipeline page > Verify loan appears with persona + status |
+
+---
+
+### M2: Document Upload & AI Classification
+**Business Process**: Borrower or LO uploads a document, AI identifies what it is, extracts key data, and checks it off the list. If the doc is wrong or incomplete, it tells the user what's needed.
+
+| E2E Test | Steps |
+|----------|-------|
+| Upload W-2 → auto-classified | Loan detail > Upload W-2 PDF > Watch status change to "Classifying" > "Classified" > Verify type = "W-2", extracted employer name + wages appear > Checklist item turns green |
+| Upload bank statement → large deposit flagged | Upload bank stmt with $15K deposit > Verify classified as "Bank Statement" > Verify flag: "Large deposit requires LOE" > Message sent to LO |
+| Upload wrong doc type | Upload a photo ID when W-2 is expected > Verify it classifies correctly as "Photo ID" not "W-2" > Correct checklist item updates |
+| Duplicate detection | Upload same W-2 twice > Verify rejection "Duplicate document already uploaded" |
+| Upload blurry/unreadable doc | Upload low-quality scan > Verify status = "Needs Review" with message |
+| Condition auto-linked | Upload doc that satisfies a PTD condition > Verify condition status changes Open → Received |
+| Real-time UI update | Upload doc > Verify checklist progress bar updates without page refresh (SSE) |
+
+---
+
+### M3: Income Calculation & Borrower Qualification
+**Business Process**: Once income documents are uploaded, AI calculates qualifying income per FNMA rules, computes DTI, and tells the LO/UW if the borrower qualifies - with full line-by-line audit trail.
+
+| E2E Test | Steps |
+|----------|-------|
+| W-2 income calculation | Upload 2 years W-2 + 30 days pay stubs > Verify income worksheet appears > Check: base salary, YTD comparison, uses lower of current vs prior year > Verify DTI calculated |
+| Self-employed income | Upload 2yr personal + business tax returns > Verify 1084/1088 worksheet > Check: net income + depreciation add-backs, 2-year average > Verify DTI |
+| Commission declining income flag | Upload W-2s showing $120K year 1, $95K year 2 > Verify flag: "Declining income trend -20.8%" > LOE request auto-generated |
+| DTI exceeds limit | Calculate income where DTI back-end > 45% > Verify UI shows red warning > Flag on UW dashboard |
+| Rental income with PITIA offset | Upload Schedule E + leases > Verify: 75% gross rent - PITIA per property > Net rental income calculated |
+| Cross-validation catches mismatch | Upload W-2 showing $80K but pay stubs showing $95K annualized > Verify flag: "Income discrepancy between W-2 and pay stubs" |
+
+---
+
+### M4: Full Verification (Assets + Employment + Credit)
+**Business Process**: AI verifies the borrower's entire financial profile - bank accounts, employment history, credit - and auto-requests clarification for any discrepancies.
+
+| E2E Test | Steps |
+|----------|-------|
+| Bank statement verification | Upload 2 months bank stmts > Verify balances extracted > Large deposits flagged > Funds-to-close worksheet generated |
+| Gift fund validation | Upload gift letter + donor bank stmt > Verify: donor identified, amount matches, transfer trail documented |
+| Employment gap detection | Upload VOE showing 3-month gap in employment > Verify flag: "Employment gap Jun-Aug 2024" > LOE request sent |
+| Employer name mismatch | W-2 says "ABC Corp", VOE says "ABC Corporation Inc" > Verify fuzzy match succeeds OR flag if truly different |
+| Credit score display | Credit report data populated > Verify: all 3 bureau scores shown, representative score selected (middle for single, lower-middle for co-borrower) |
+| Undisclosed debt detected | Credit report shows auto loan not on 1003 > Verify flag: "Undisclosed liability - auto loan $450/mo" > DTI recalculated |
+| Auto-LOE for credit inquiry | Credit report has 3 recent inquiries > Verify: LOE request auto-generated listing each inquiry > Borrower sees in message center |
+
+---
+
+### M5: Third-Party Services & Property
+**Business Process**: System orders appraisal, title, insurance, flood cert, and PMI - tracks their status - and validates results when they come back.
+
+| E2E Test | Steps |
+|----------|-------|
+| Appraisal ordered | LO triggers appraisal order > Verify: order placed via Encompass API > Status shows "Ordered" in UI > Fee recorded |
+| Appraisal value reconciliation | Appraisal comes back at $425K, purchase price $450K > Verify: LTV recalculated using lower value > PMI triggered if >80% |
+| Title exception flagged | Title commitment received with open judgment > Verify flag: "Open judgment - $12,500" on UW dashboard |
+| Flood zone detection | Flood cert returns Zone A > Verify: "Flood insurance required" flag > HOI checklist item updated |
+| Fee tolerance violation | Appraisal fee $650, original LE showed $500 > Verify: "Zero tolerance violation - appraisal fee exceeded by $150" flag |
+| All services tracked | UI shows status of every ordered service: ordered/received/reviewed with dates |
+
+---
+
+### M6: UW Dashboard & Pre-Submission
+**Business Process**: UW opens a loan and sees a single view with everything validated, every flag, every agent decision - ready to approve, condition, or deny.
+
+| E2E Test | Steps |
+|----------|-------|
+| Pipeline with readiness scores | Login as UW > Pipeline shows all loans > Each has AI Readiness Score (0-100) color-coded green/yellow/red |
+| Validation matrix | Click loan > Validation Matrix tab > Every check listed: agent name, what it checked, confidence score, pass/fail, source docs |
+| Income worksheet drill-down | Click income validation row > Full FNMA worksheet with line items, source doc thumbnails, guideline citations |
+| Condition tracker | Conditions tab > All PTD/PTF/PTC > Status badges > Outstanding items highlighted red > Click to see linked documents |
+| Risk flags dashboard | Risk Flags tab > All flags from all agents aggregated > Severity-sorted > Click to see agent reasoning |
+| Audit trail | Audit tab > Chronological log of every agent action > Full reasoning chain visible > Timestamp + agent name + confidence |
+| QC scorecard | Pre-submission QC tab > Pass/fail per check > "Ready for submission" or "X items need attention" |
+| Clear condition | UW marks condition as Cleared > Status updates in real-time > Encompass synced |
+| Approve loan | All conditions cleared > QC passes > UW clicks "Clear to Close" > Milestone advances in Encompass |
+
+---
+
+### M7: Borrower Portal & Communication
+**Business Process**: Borrower logs in, sees exactly what they need to upload, gets AI-guided help, uploads docs, and tracks their loan status in real-time.
+
+| E2E Test | Steps |
+|----------|-------|
+| Borrower sees checklist | Login as borrower > See dynamic checklist with green/yellow/red status > Missing items at top |
+| Borrower uploads doc | Click "Upload" on checklist item > Upload W-2 > See spinner > Classification result appears > Item turns green |
+| Borrower gets needs request | LO/system sends needs list > Borrower sees notification > Message lists exactly what's needed with descriptions |
+| LOE guided flow | Borrower sees "LOE needed for credit inquiry" > Clicks "Generate LOE" > Guided Q&A asks about each inquiry > Auto-drafts letter > Borrower reviews and submits |
+| Loan status timeline | Borrower sees visual timeline: Application > Processing > Underwriting > Clear to Close > Closing |
+| Real-time updates | Document classified or condition cleared > Borrower sees update without refreshing |
+
+---
+
+### M8: End-to-End Loan Lifecycle & Production
+**Business Process**: A complete loan from application to funded - the entire processor role demonstrated as automated.
+
+| E2E Test | Steps |
+|----------|-------|
+| Full W-2 purchase loan | LO creates loan > Borrower uploads all docs > AI classifies + calculates income + verifies assets + checks credit > All conditions satisfied > UW reviews dashboard > CTC > CD sent > Closing |
+| Full self-employed refi | Same flow but self-employed persona > Business tax returns > 1084/1088 worksheet > Different doc checklist |
+| Commission borrower with issues | Commission borrower > Declining income > Large deposit > Employment gap > System catches all 3, requests LOEs, re-validates after responses |
+| Multi-tenant onboarding | New company signs up > Connects their Encompass > First loan flows through |
+| Load test | 50 concurrent loans processing > All agents complete within SLA > No data leakage between tenants |
+| Security audit | Pentest report clean > SOC 2 controls documented > PII properly encrypted |
 
 ## Contributing
 

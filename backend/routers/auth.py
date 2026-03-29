@@ -9,6 +9,8 @@ from sqlalchemy import select
 
 from ..core.config import get_settings
 from ..dependencies import DB, CurrentUser
+
+settings = get_settings()
 from ..db.models.tenant import Tenant
 from ..db.models.user import User
 from ..shared.types import UserRole

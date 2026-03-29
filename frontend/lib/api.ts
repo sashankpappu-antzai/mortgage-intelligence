@@ -199,7 +199,20 @@ export async function getPipeline(params?: { status?: string }): Promise<Pipelin
 
 export function subscribeLoanEvents(loanId: string, onMessage: (data: unknown) => void): () => void {
   const token = typeof window !== "undefined" ? localStorage.getItem("access_token") : null;
-  const url = `${API_BASE}/api/dashboard/events/loan/${loanId}`;
+  // EventSource doesn't support custom headers - pass token as query param
+  const url = `${API_BASE}/api/dashboard/events/loan/${loanId}${token ? `?token=${token}` : ""}`;
+  const es = new EventSource(url);
+  es.onmessage = (event) => onMessage(JSON.parse(event.data));
+  es.onerror = () => {
+    // Auto-reconnect is built into EventSource, but log for debugging
+    console.warn("SSE connection error, will auto-reconnect");
+  };
+  return () => es.close();
+}
+
+export function subscribePipelineEvents(onMessage: (data: unknown) => void): () => void {
+  const token = typeof window !== "undefined" ? localStorage.getItem("access_token") : null;
+  const url = `${API_BASE}/api/dashboard/events/pipeline${token ? `?token=${token}` : ""}`;
   const es = new EventSource(url);
   es.onmessage = (event) => onMessage(JSON.parse(event.data));
   return () => es.close();

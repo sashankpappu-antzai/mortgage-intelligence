@@ -12,6 +12,8 @@ from sqlalchemy import select
 
 from ..core.config import get_settings
 from ..events.sse import broadcast_loan_event
+
+settings = get_settings()
 from ..db.models.audit import AuditEvent
 from ..db.models.condition import Condition
 from ..db.models.loan import Loan

@@ -2,6 +2,43 @@ const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 type FetchOptions = RequestInit & { token?: string };
 
+// Deduplicate concurrent refresh calls — only one in-flight at a time
+let _refreshPromise: Promise<string | null> | null = null;
+
+async function refreshAccessToken(): Promise<string | null> {
+  if (_refreshPromise) return _refreshPromise;
+
+  _refreshPromise = (async () => {
+    const refreshToken = typeof window !== "undefined" ? localStorage.getItem("refresh_token") : null;
+    if (!refreshToken) return null;
+
+    try {
+      const res = await fetch(`${API_BASE}/api/auth/refresh`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ refresh_token: refreshToken }),
+      });
+
+      if (!res.ok) {
+        localStorage.removeItem("access_token");
+        localStorage.removeItem("refresh_token");
+        localStorage.removeItem("user");
+        return null;
+      }
+
+      const data = await res.json();
+      localStorage.setItem("access_token", data.access_token);
+      localStorage.setItem("refresh_token", data.refresh_token);
+      localStorage.setItem("user", JSON.stringify(data.user));
+      return data.access_token as string;
+    } finally {
+      _refreshPromise = null;
+    }
+  })();
+
+  return _refreshPromise;
+}
+
 async function apiFetch<T>(path: string, options: FetchOptions = {}): Promise<T> {
   const { token, ...fetchOptions } = options;
   const headers: Record<string, string> = {
@@ -16,12 +53,24 @@ async function apiFetch<T>(path: string, options: FetchOptions = {}): Promise<T>
     if (stored) headers["Authorization"] = `Bearer ${stored}`;
   }
 
-  const res = await fetch(`${API_BASE}${path}`, { ...fetchOptions, headers });
+  let res = await fetch(`${API_BASE}${path}`, { ...fetchOptions, headers });
+
+  // On 401, attempt silent token refresh and retry once
+  if (res.status === 401 && !token) {
+    const newToken = await refreshAccessToken();
+    if (newToken) {
+      headers["Authorization"] = `Bearer ${newToken}`;
+      res = await fetch(`${API_BASE}${path}`, { ...fetchOptions, headers });
+    }
+  }
 
   if (!res.ok) {
     const body = await res.json().catch(() => ({ detail: res.statusText }));
     throw new Error(body.detail || `API error: ${res.status}`);
   }
+
+  // 204 No Content — nothing to parse
+  if (res.status === 204) return undefined as T;
 
   return res.json();
 }
@@ -57,6 +106,49 @@ export async function register(data: {
 
 export async function getMe() {
   return apiFetch<{ id: string; email: string; name: string; role: string; tenant_id: string }>("/api/auth/me");
+}
+
+// --- Microsoft / Azure AD ---
+
+export interface MicrosoftConfig {
+  configured: boolean;
+  tenant_id?: string;
+  client_id?: string;
+  redirect_uri?: string;
+}
+
+export interface MicrosoftLoginResponse {
+  needs_role?: boolean;
+  email?: string;
+  name?: string;
+  azure_ad_oid?: string;
+  access_token?: string;
+  refresh_token?: string;
+  token_type?: string;
+  user?: { id: string; email: string; name: string; role: string };
+}
+
+export async function getMicrosoftConfig(): Promise<MicrosoftConfig> {
+  return apiFetch<MicrosoftConfig>("/api/auth/microsoft/config");
+}
+
+export async function microsoftLogin(code: string, redirectUri: string): Promise<MicrosoftLoginResponse> {
+  return apiFetch<MicrosoftLoginResponse>("/api/auth/microsoft", {
+    method: "POST",
+    body: JSON.stringify({ code, redirect_uri: redirectUri }),
+  });
+}
+
+export async function microsoftComplete(data: {
+  code: string;
+  redirect_uri: string;
+  role: string;
+  tenant_name: string;
+}): Promise<TokenResponse> {
+  return apiFetch<TokenResponse>("/api/auth/microsoft/complete", {
+    method: "POST",
+    body: JSON.stringify(data),
+  });
 }
 
 // --- Loans ---
@@ -149,23 +241,182 @@ export async function createLoan(data: {
 
 // --- Documents ---
 
+export interface DocumentItem {
+  id: string;
+  loan_id: string;
+  document_type: string | null;
+  category: string | null;
+  title: string | null;
+  file_name: string;
+  status: string;
+  classification_confidence: number | null;
+  extracted_data: Record<string, unknown> | null;
+  page_count: number | null;
+  created_at: string;
+}
+
+// --- Validations ---
+
+export interface ValidationResult {
+  id: string;
+  agent_name: string;
+  validation_type: string;
+  confidence_score: number;
+  confidence_level: string;
+  status: string;
+  flags: Record<string, unknown> | null;
+  result: {
+    identity?: Record<string, unknown>;
+    employer?: Record<string, unknown>;
+    income?: Record<string, unknown>;
+    completeness?: {
+      documents?: Array<{
+        doc_id: string;
+        document_type: string;
+        file_name: string;
+        complete: boolean;
+        deficiencies: Array<{
+          field: string;
+          severity: string;
+          message: string;
+          action_required: string;
+        }>;
+        stale?: boolean;
+        stale_reason?: string;
+        missing_pages?: boolean;
+        missing_signature?: boolean;
+      }>;
+      total_deficiencies?: number;
+      critical_count?: number;
+      confidence?: number;
+      flags?: string[];
+      skipped?: boolean;
+    };
+    gaps?: {
+      missing_documents?: Array<{
+        document_type: string;
+        label: string;
+        category: string;
+        required: boolean;
+        priority: string;
+        borrower_message: string;
+        processor_note?: string;
+      }>;
+      re_upload_needed?: Array<{
+        document_type: string;
+        doc_id: string;
+        file_name: string;
+        reason: string;
+      }>;
+      checklist_completion_pct?: number;
+      total_required?: number;
+      total_received?: number;
+      total_missing?: number;
+      needs_list_summary?: string;
+      confidence?: number;
+      flags?: string[];
+      skipped?: boolean;
+    };
+    aggregate?: {
+      overall_pass?: boolean;
+      overall_confidence?: number;
+      identity_pass?: boolean;
+      employer_pass?: boolean;
+      income_pass?: boolean;
+      completeness_pass?: boolean;
+      checklist_pass?: boolean;
+      critical_flags?: string[];
+      warnings?: string[];
+      borrower_action_items?: string[];
+      recommendation?: string;
+      summary?: string;
+    };
+  };
+  processing_time_ms: number | null;
+  created_at: string;
+}
+
+export async function listValidations(loanId: string): Promise<ValidationResult[]> {
+  return apiFetch<ValidationResult[]>(`/api/loans/${loanId}/validations`);
+}
+
+export async function triggerValidation(loanId: string): Promise<{ message: string }> {
+  return apiFetch<{ message: string }>(`/api/loans/${loanId}/validate`, { method: "POST" });
+}
+
+export async function deleteLoan(loanId: string): Promise<void> {
+  await apiFetch(`/api/loans/${loanId}`, { method: "DELETE" });
+}
+
+export async function deleteBorrower(loanId: string, borrowerId: string): Promise<void> {
+  await apiFetch(`/api/loans/${loanId}/borrowers/${borrowerId}`, { method: "DELETE" });
+}
+
+export async function listDocuments(loanId: string): Promise<DocumentItem[]> {
+  const res = await apiFetch<{ documents: DocumentItem[]; total: number }>(`/api/loans/${loanId}/documents`);
+  return res.documents;
+}
+
 export async function uploadDocument(loanId: string, file: File, documentType?: string): Promise<unknown> {
   const formData = new FormData();
   formData.append("file", file);
-  if (documentType) formData.append("document_type", documentType);
+  const url = `${API_BASE}/api/loans/${loanId}/documents${documentType ? `?document_type=${encodeURIComponent(documentType)}` : ""}`;
+
+  async function doUpload(token: string | null) {
+    return fetch(url, {
+      method: "POST",
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      body: formData,
+    });
+  }
 
   const token = typeof window !== "undefined" ? localStorage.getItem("access_token") : null;
-  const res = await fetch(`${API_BASE}/api/loans/${loanId}/documents`, {
-    method: "POST",
-    headers: token ? { Authorization: `Bearer ${token}` } : {},
-    body: formData,
-  });
+  let res = await doUpload(token);
+
+  if (res.status === 401) {
+    const newToken = await refreshAccessToken();
+    if (newToken) res = await doUpload(newToken);
+  }
 
   if (!res.ok) {
     const body = await res.json().catch(() => ({ detail: res.statusText }));
     throw new Error(body.detail || `Upload failed: ${res.status}`);
   }
   return res.json();
+}
+
+export async function getDocumentFileBlob(loanId: string, documentId: string): Promise<Blob> {
+  const token = typeof window !== "undefined" ? localStorage.getItem("access_token") : null;
+  const res = await fetch(`${API_BASE}/api/loans/${loanId}/documents/${documentId}/file`, {
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  });
+  if (res.status === 401) {
+    const newToken = await refreshAccessToken();
+    if (newToken) {
+      const retry = await fetch(`${API_BASE}/api/loans/${loanId}/documents/${documentId}/file`, {
+        headers: { Authorization: `Bearer ${newToken}` },
+      });
+      if (!retry.ok) throw new Error("Failed to load document file");
+      return retry.blob();
+    }
+  }
+  if (!res.ok) throw new Error("Failed to load document file");
+  return res.blob();
+}
+
+export async function confirmDocument(
+  loanId: string,
+  documentId: string,
+  updates: { document_type?: string; status?: string }
+): Promise<DocumentItem> {
+  return apiFetch<DocumentItem>(`/api/loans/${loanId}/documents/${documentId}`, {
+    method: "PATCH",
+    body: JSON.stringify(updates),
+  });
+}
+
+export async function deleteDocument(loanId: string, documentId: string): Promise<void> {
+  await apiFetch(`/api/loans/${loanId}/documents/${documentId}`, { method: "DELETE" });
 }
 
 // --- Dashboard ---

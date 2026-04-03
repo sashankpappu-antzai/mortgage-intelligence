@@ -3,7 +3,7 @@ Persona-based document checklist generator for conventional loans.
 Maps borrower persona + loan parameters to required documents per FNMA Selling Guide.
 """
 
-from ...shared.types import BorrowerPersona, DocumentCategory, DocumentType
+from ....shared.types import BorrowerPersona, DocumentCategory, DocumentType
 
 
 def classify_persona(

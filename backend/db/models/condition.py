@@ -41,7 +41,7 @@ class Condition(Base, TenantMixin, TimestampMixin):
     # Metadata
     due_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
-    metadata: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    extra_data: Mapped[dict | None] = mapped_column("metadata", JSONB, nullable=True)
 
     loan = relationship("Loan", back_populates="conditions")
 

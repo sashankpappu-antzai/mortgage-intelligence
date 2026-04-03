@@ -1,43 +1,47 @@
-"""Azure AD OAuth2 authentication dependency."""
+"""Azure AD OAuth2 — token exchange and user info extraction."""
 
-from fastapi import Depends, HTTPException, status
-from fastapi.security import OAuth2AuthorizationCodeBearer
-import jwt
+import httpx
 
 from ..core.config import get_settings
 
 settings = get_settings()
 
-azure_ad_scheme = OAuth2AuthorizationCodeBearer(
-    authorizationUrl=(
-        f"https://login.microsoftonline.com/{settings.azure_ad_tenant_id}/oauth2/v2.0/authorize"
-    ),
-    tokenUrl=(
+
+def is_configured() -> bool:
+    """Check if Azure AD is configured."""
+    return bool(settings.azure_ad_tenant_id and settings.azure_ad_client_id)
+
+
+async def exchange_code_for_tokens(code: str, redirect_uri: str) -> dict:
+    """Exchange authorization code for Azure AD tokens."""
+    token_url = (
         f"https://login.microsoftonline.com/{settings.azure_ad_tenant_id}/oauth2/v2.0/token"
-    ),
-)
-
-_JWKS_URI = (
-    f"https://login.microsoftonline.com/{settings.azure_ad_tenant_id}/discovery/v2.0/keys"
-)
-
-
-async def get_current_user(token: str = Depends(azure_ad_scheme)) -> dict:
-    """Validate the Azure AD JWT and return the decoded claims."""
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
     )
-    try:
-        jwks_client = jwt.PyJWKClient(_JWKS_URI)
-        signing_key = jwks_client.get_signing_key_from_jwt(token)
-        payload = jwt.decode(
-            token,
-            signing_key.key,
-            algorithms=["RS256"],
-            audience=settings.azure_ad_client_id,
-        )
-        return payload
-    except jwt.PyJWTError:
-        raise credentials_exception
+    data = {
+        "client_id": settings.azure_ad_client_id,
+        "client_secret": settings.azure_ad_client_secret,
+        "code": code,
+        "redirect_uri": redirect_uri,
+        "grant_type": "authorization_code",
+        "scope": "openid profile email",
+    }
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(token_url, data=data)
+        resp.raise_for_status()
+        return resp.json()
+
+
+def extract_user_info(id_token: str) -> dict:
+    """Decode the ID token (without full signature verification for code flow).
+
+    In the authorization code flow, the token comes directly from Microsoft's
+    token endpoint over HTTPS, so signature verification is optional per spec.
+    """
+    import jwt as pyjwt
+
+    claims = pyjwt.decode(id_token, options={"verify_signature": False})
+    return {
+        "oid": claims.get("oid"),
+        "email": claims.get("preferred_username") or claims.get("email", ""),
+        "name": claims.get("name", ""),
+    }

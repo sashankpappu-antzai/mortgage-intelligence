@@ -10,12 +10,13 @@ dependencies = [
   "uvicorn[standard]>=0.30",
   "python-multipart>=0.0.12",
   # Validation & config (MIT)
-  "pydantic>=2.0",
+  "pydantic[email]>=2.0",
   "pydantic-settings>=2.0",
   # Auth (MIT)
   "PyJWT[crypto]>=2.8",
   "python-jose[cryptography]>=3.3",
   "passlib[bcrypt]>=1.7",
+  "bcrypt>=4.0,<4.3",
   # Database (MIT / BSD)
   "sqlalchemy[asyncio]>=2.0",
   "asyncpg>=0.29",
@@ -34,6 +35,8 @@ dependencies = [
   "langfuse>=2.0",
   # Anthropic Claude (optional cloud LLM)
   "anthropic>=0.30",
+  # PDF text extraction for document classifier
+  "pypdf>=4.0",
 ]
 
 [tool.uv]

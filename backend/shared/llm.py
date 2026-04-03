@@ -11,14 +11,22 @@ Provider options:
   - anthropic: Anthropic Claude API (optional, requires API key)
 """
 
+import asyncio
 import json
 import logging
+import random
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# Retry settings for rate-limit (429) and transient server errors (5xx)
+_MAX_RETRIES = 5
+_BASE_DELAY_SECONDS = 2.0   # 2s, 4s, 8s, 16s, 32s
+_MAX_DELAY_SECONDS = 60.0
+_JITTER_FACTOR = 0.5  # ±50% random jitter to de-synchronize retries
 
 
 @dataclass
@@ -288,6 +296,124 @@ class OpenAICompatibleProvider(LLMProvider):
         await self._http.aclose()
 
 
+class AnthropicProvider(LLMProvider):
+    """
+    Anthropic Claude API using the native anthropic SDK.
+    Supports text + vision (claude-sonnet-4-6, claude-opus-4-6).
+    Requires ANTHROPIC_API_KEY.
+
+    Includes automatic retry with exponential backoff for:
+      - 429 Rate Limit errors (respects Retry-After header)
+      - 529 Overloaded errors
+      - 500/502/503 transient server errors
+    """
+
+    def __init__(self, api_key: str, default_model: str = "claude-sonnet-4-6"):
+        import anthropic as _anthropic
+        self._anthropic_module = _anthropic
+        self._client = _anthropic.AsyncAnthropic(api_key=api_key)
+        self.default_model = default_model
+
+    def _is_retryable(self, exc: Exception) -> bool:
+        """Check if an Anthropic SDK exception is retryable (rate limit or transient)."""
+        anthropic = self._anthropic_module
+
+        # Rate limit — always retry
+        if isinstance(exc, anthropic.RateLimitError):
+            return True
+
+        # Overloaded (529) — retry
+        if isinstance(exc, anthropic.APIStatusError) and getattr(exc, "status_code", 0) == 529:
+            return True
+
+        # Transient server errors (500, 502, 503)
+        if isinstance(exc, anthropic.InternalServerError):
+            return True
+
+        return False
+
+    def _get_retry_after(self, exc: Exception) -> float | None:
+        """Extract Retry-After header from an API error response, if present."""
+        response = getattr(exc, "response", None)
+        if response is not None:
+            retry_after = getattr(response, "headers", {}).get("retry-after")
+            if retry_after:
+                try:
+                    return float(retry_after)
+                except (ValueError, TypeError):
+                    pass
+        return None
+
+    async def chat(
+        self,
+        messages: list[LLMMessage],
+        model: str | None = None,
+        temperature: float = 0.0,
+        max_tokens: int = 4096,
+        json_mode: bool = False,
+    ) -> LLMResponse:
+        model = model or self.default_model
+        system_parts = [m.content for m in messages if m.role == "system" and isinstance(m.content, str)]
+        system = "\n".join(system_parts)
+        if json_mode:
+            system += "\n\nYou must respond with valid JSON only. No markdown, no explanation, just the JSON object."
+
+        filtered = [{"role": m.role, "content": m.content} for m in messages if m.role != "system"]
+
+        kwargs: dict = dict(model=model, max_tokens=max_tokens, messages=filtered)
+        if system:
+            kwargs["system"] = system
+
+        last_exc: Exception | None = None
+        for attempt in range(_MAX_RETRIES + 1):  # attempt 0 = first try, then up to _MAX_RETRIES retries
+            try:
+                resp = await self._client.messages.create(**kwargs)
+                content = resp.content[0].text if resp.content else ""
+                return LLMResponse(
+                    content=content,
+                    model=model,
+                    input_tokens=resp.usage.input_tokens,
+                    output_tokens=resp.usage.output_tokens,
+                    finish_reason=resp.stop_reason or "stop",
+                )
+            except Exception as exc:
+                last_exc = exc
+                if not self._is_retryable(exc) or attempt == _MAX_RETRIES:
+                    raise
+
+                # Compute delay: honour Retry-After header, else exponential backoff + jitter
+                retry_after = self._get_retry_after(exc)
+                if retry_after and retry_after > 0:
+                    delay = min(retry_after, _MAX_DELAY_SECONDS)
+                else:
+                    base = _BASE_DELAY_SECONDS * (2 ** attempt)
+                    jitter = base * _JITTER_FACTOR * (2 * random.random() - 1)
+                    delay = min(base + jitter, _MAX_DELAY_SECONDS)
+
+                logger.warning(
+                    "Anthropic API %s (attempt %d/%d), retrying in %.1fs: %s",
+                    type(exc).__name__,
+                    attempt + 1,
+                    _MAX_RETRIES + 1,
+                    delay,
+                    str(exc)[:200],
+                )
+                await asyncio.sleep(delay)
+
+        # Should not reach here, but just in case
+        raise last_exc  # type: ignore[misc]
+
+    async def chat_with_vision(
+        self,
+        messages: list[LLMMessage],
+        model: str | None = None,
+        temperature: float = 0.0,
+        max_tokens: int = 4096,
+    ) -> LLMResponse:
+        # Vision content is already embedded in message content as list[dict]
+        return await self.chat(messages, model=model, temperature=temperature, max_tokens=max_tokens)
+
+
 def create_llm(
     provider: str = "ollama",
     base_url: str = "",
@@ -323,15 +449,14 @@ def create_llm(
             default_model=default_model or "ollama/llama3.1",
             api_key=api_key,
         )
-    elif provider in ("openai", "anthropic", "custom"):
-        urls = {
-            "openai": "https://api.openai.com",
-            "anthropic": "https://api.anthropic.com",  # Needs compatible proxy
-        }
-        models = {
-            "openai": "gpt-4o",
-            "anthropic": "claude-sonnet-4-20250514",
-        }
+    elif provider == "anthropic":
+        return AnthropicProvider(
+            api_key=api_key,
+            default_model=default_model or "claude-sonnet-4-6",
+        )
+    elif provider in ("openai", "custom"):
+        urls = {"openai": "https://api.openai.com"}
+        models = {"openai": "gpt-4o"}
         return OpenAICompatibleProvider(
             base_url=base_url or urls.get(provider, base_url),
             api_key=api_key,

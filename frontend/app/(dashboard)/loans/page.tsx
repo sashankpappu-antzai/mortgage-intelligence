@@ -1,11 +1,13 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { listLoans, type LoanSummary } from "@/lib/api";
+import { listLoans, deleteLoan, type LoanSummary } from "@/lib/api";
 import { formatCurrency, formatPersona, formatPhase, formatStatus, statusColor } from "@/lib/utils";
 
 export default function LoansPage() {
+  const router = useRouter();
   const [loans, setLoans] = useState<LoanSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -73,18 +75,20 @@ export default function LoansPage() {
                 <th className="text-left px-4 py-3 text-xs font-semibold text-(--color-text-secondary) uppercase tracking-wide">Phase</th>
                 <th className="text-left px-4 py-3 text-xs font-semibold text-(--color-text-secondary) uppercase tracking-wide">Status</th>
                 <th className="text-right px-4 py-3 text-xs font-semibold text-(--color-text-secondary) uppercase tracking-wide">AI Score</th>
+                <th className="px-4 py-3"></th>
               </tr>
             </thead>
             <tbody>
               {loans.map((loan) => (
                 <tr
                   key={loan.id}
+                  onClick={() => router.push(`/loans/${loan.id}`)}
                   className="border-b border-(--color-border) last:border-0 hover:bg-gray-50/50 transition-colors cursor-pointer"
                 >
                   <td className="px-4 py-3">
-                    <Link href={`/loans/${loan.id}`} className="font-medium text-sm text-(--color-text) hover:text-(--color-accent)">
+                    <span className="font-medium text-sm text-(--color-text)">
                       {loan.borrower_name || "—"}
-                    </Link>
+                    </span>
                   </td>
                   <td className="px-4 py-3 text-sm text-(--color-text-secondary) font-mono">
                     {loan.encompass_loan_number || "—"}
@@ -110,6 +114,37 @@ export default function LoansPage() {
                     ) : (
                       <span className="text-gray-300 text-sm">—</span>
                     )}
+                  </td>
+                  <td className="px-4 py-3 text-right" onClick={(e) => e.stopPropagation()}>
+                    <div className="flex items-center justify-end gap-3">
+                      <Link
+                        href={`/loans/${loan.id}`}
+                        className="text-xs font-medium text-(--color-accent) hover:underline"
+                      >
+                        Open →
+                      </Link>
+                      <button
+                        onClick={async () => {
+                          const name = loan.borrower_name || "this loan";
+                          if (!confirm(`Delete loan for ${name}? This will permanently remove the loan and all its documents, borrowers, and conditions.`)) return;
+                          try {
+                            await deleteLoan(loan.id);
+                            setLoans((prev) => prev.filter((l) => l.id !== loan.id));
+                          } catch (err) {
+                            alert(err instanceof Error ? err.message : "Failed to delete loan");
+                          }
+                        }}
+                        className="p-1 rounded text-gray-400 hover:text-red-600 hover:bg-red-50 transition-colors"
+                        title="Delete loan"
+                      >
+                        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                          <polyline points="3 6 5 6 21 6" />
+                          <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                          <line x1="10" y1="11" x2="10" y2="17" />
+                          <line x1="14" y1="11" x2="14" y2="17" />
+                        </svg>
+                      </button>
+                    </div>
                   </td>
                 </tr>
               ))}

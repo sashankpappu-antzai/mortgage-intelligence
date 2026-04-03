@@ -1,14 +1,19 @@
+import logging
 import uuid
 from datetime import datetime
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, status
+
+logger = logging.getLogger(__name__)
 from pydantic import BaseModel
 from sqlalchemy import func, select
 
 from ..dependencies import DB, CurrentUser
+from ..db.models.agent_validation import AgentValidation
 from ..db.models.condition import Condition
 from ..db.models.document import Document
 from ..db.models.loan import Loan, LoanBorrower
+from ..db.models.message import Message
 from ..services.rules.doc_requirements.checklists import generate_checklist
 from ..shared.types import (
     BorrowerPersona,
@@ -202,7 +207,19 @@ async def create_loan(req: LoanCreate, user: CurrentUser, db: DB):
     if primary:
         loan.primary_borrower_persona = primary.persona
 
+    # Calculate LTV immediately if we have loan_amount and purchase_price
+    if req.loan_amount and req.purchase_price and req.purchase_price > 0:
+        from ..services.loan_metrics import compute_ltv, compute_cltv, compute_property_value
+
+        prop_val = compute_property_value(req.purchase_price, None)
+        loan.ltv = compute_ltv(req.loan_amount, prop_val)
+        loan.cltv = compute_cltv(req.loan_amount, prop_val)
+
+    # Initial AI readiness score (just checklist + metrics)
+    loan.ai_readiness_score = 5.0  # Starting score with no docs
+
     await db.flush()
+    await db.refresh(loan)
 
     # Generate checklist
     checklist = _build_checklist(loan, borrowers, [])
@@ -232,6 +249,121 @@ async def get_loan(loan_id: uuid.UUID, user: CurrentUser, db: DB):
     checklist = _build_checklist(loan, loan.borrowers, documents)
 
     return _loan_to_detail(loan, loan.borrowers, checklist, cond_summary)
+
+
+class ValidationSummary(BaseModel):
+    id: str
+    agent_name: str
+    validation_type: str
+    confidence_score: float
+    confidence_level: str
+    status: str
+    flags: dict | None
+    result: dict
+    processing_time_ms: int | None
+    created_at: datetime
+
+
+@router.get("/{loan_id}/validations", response_model=list[ValidationSummary])
+async def list_validations(loan_id: uuid.UUID, user: CurrentUser, db: DB):
+    """Get all validation results for a loan."""
+    await _get_loan_or_404(loan_id, user, db)
+
+    result = await db.execute(
+        select(AgentValidation)
+        .where(AgentValidation.loan_id == loan_id)
+        .order_by(AgentValidation.created_at.desc())
+    )
+    validations = result.scalars().all()
+
+    return [
+        ValidationSummary(
+            id=str(v.id),
+            agent_name=v.agent_name,
+            validation_type=v.validation_type,
+            confidence_score=float(v.confidence_score),
+            confidence_level=v.confidence_level,
+            status=v.status,
+            flags=v.flags,
+            result=v.result,
+            processing_time_ms=v.processing_time_ms,
+            created_at=v.created_at,
+        )
+        for v in validations
+    ]
+
+
+@router.post("/{loan_id}/validate", status_code=status.HTTP_202_ACCEPTED)
+async def trigger_validation(
+    loan_id: uuid.UUID, user: CurrentUser, db: DB, background_tasks: BackgroundTasks,
+):
+    """Manually trigger cross-document validation for a loan."""
+    await _get_loan_or_404(loan_id, user, db)
+
+    async def _run_validation(lid: str) -> None:
+        from ..agents.cross_doc_validator.agent import run_cross_doc_validation
+        await run_cross_doc_validation(lid)
+        # Recalculate metrics after validation (updates AI readiness score)
+        try:
+            from ..services.loan_metrics import recalculate_loan_metrics
+            await recalculate_loan_metrics(lid)
+        except Exception as e:
+            logger.warning("Post-validation metrics recalculation failed: %s", e)
+
+    background_tasks.add_task(_run_validation, str(loan_id))
+    return {"message": "Validation started", "loan_id": str(loan_id)}
+
+
+@router.delete("/{loan_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_loan(loan_id: uuid.UUID, user: CurrentUser, db: DB):
+    """Delete a loan and all associated data (borrowers, documents, conditions)."""
+    loan = await _get_loan_or_404(loan_id, user, db)
+
+    # Delete all child records that have FK to loan
+    await db.execute(AgentValidation.__table__.delete().where(AgentValidation.loan_id == loan.id))
+    await db.execute(Message.__table__.delete().where(Message.loan_id == loan.id))
+    await db.execute(Document.__table__.delete().where(Document.loan_id == loan.id))
+    await db.execute(Condition.__table__.delete().where(Condition.loan_id == loan.id))
+    await db.execute(LoanBorrower.__table__.delete().where(LoanBorrower.loan_id == loan.id))
+
+    await db.delete(loan)
+    await db.commit()
+
+
+@router.delete("/{loan_id}/borrowers/{borrower_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_borrower(loan_id: uuid.UUID, borrower_id: uuid.UUID, user: CurrentUser, db: DB):
+    """Delete a borrower from a loan. Unlinks any associated documents."""
+    loan = await _get_loan_or_404(loan_id, user, db)
+
+    result = await db.execute(
+        select(LoanBorrower).where(
+            LoanBorrower.id == borrower_id,
+            LoanBorrower.loan_id == loan.id,
+        )
+    )
+    borrower = result.scalar_one_or_none()
+    if not borrower:
+        raise HTTPException(status_code=404, detail="Borrower not found")
+
+    # Unlink any documents associated with this borrower (set borrower_id to NULL)
+    await db.execute(
+        Document.__table__.update()
+        .where(Document.borrower_id == borrower_id)
+        .values(borrower_id=None)
+    )
+
+    await db.delete(borrower)
+    await db.flush()
+
+    # Recalculate primary_borrower_persona
+    remaining = [b for b in loan.borrowers if b.id != borrower_id]
+    if remaining:
+        primary = next((b for b in remaining if b.borrower_type == "primary"), remaining[0])
+        loan.primary_borrower_persona = primary.persona
+    else:
+        loan.primary_borrower_persona = None
+
+    await db.commit()
 
 
 async def _get_loan_or_404(loan_id: uuid.UUID, user: CurrentUser, db: DB) -> Loan:

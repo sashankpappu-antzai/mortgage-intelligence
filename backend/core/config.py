@@ -16,6 +16,8 @@ class Settings(BaseSettings):
     # Azure AD (optional - falls back to JWT when not set)
     azure_ad_tenant_id: str = ""
     azure_ad_client_id: str = ""
+    azure_ad_client_secret: str = ""
+    azure_ad_redirect_uri: str = ""
 
     # Auth (JWT - used when Azure AD not configured)
     jwt_secret_key: str = "dev-secret-change-in-production"

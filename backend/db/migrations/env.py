@@ -1,4 +1,5 @@
 import asyncio
+import os
 from logging.config import fileConfig
 
 from alembic import context
@@ -15,6 +16,11 @@ from backend.db.models import Base
 config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
+
+# Override sqlalchemy.url from environment if available
+postgres_url = os.environ.get("POSTGRES_URL")
+if postgres_url:
+    config.set_main_option("sqlalchemy.url", postgres_url)
 
 target_metadata = Base.metadata
 

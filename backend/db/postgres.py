@@ -9,7 +9,7 @@ from ..core.config import get_settings
 
 settings = get_settings()
 
-_engine = create_async_engine(settings.postgres_url, echo=settings.app_env == "dev")
+_engine = create_async_engine(settings.postgres_url, echo=settings.sql_echo)
 _SessionFactory = async_sessionmaker(_engine, expire_on_commit=False)
 
 

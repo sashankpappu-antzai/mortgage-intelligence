@@ -37,6 +37,10 @@ dependencies = [
   "anthropic>=0.30",
   # PDF text extraction for document classifier
   "pypdf>=4.0",
+  # Rate limiting for auth endpoints (MIT)
+  "slowapi>=0.1.9",
+  # Magic-byte file-type detection (pure-Python, no libmagic dep) (MIT)
+  "filetype>=1.2",
 ]
 
 [tool.uv]

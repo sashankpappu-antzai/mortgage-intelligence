@@ -5,8 +5,11 @@ Handles file upload, triggers classification pipeline, and serves document data.
 
 import hashlib
 import logging
+import os
+import re
 import uuid
 
+import filetype
 from fastapi import APIRouter, BackgroundTasks, HTTPException, UploadFile, status
 from fastapi.responses import Response
 from pydantic import BaseModel
@@ -16,11 +19,75 @@ from ..dependencies import DB, CurrentUser
 from ..events.sse import broadcast_loan_event
 from ..db.models.document import Document
 from ..db.models.loan import Loan
-from ..shared.types import DocumentCategory, DocumentStatus, DocumentType
+from ..shared.types import DocumentStatus, DocumentType
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/loans/{loan_id}/documents", tags=["documents"])
+
+# ---------------------------------------------------------------------------
+# Upload hardening
+# ---------------------------------------------------------------------------
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MiB hard cap
+
+# MIME types we are willing to accept AND serve back inline.  Anything else is
+# either rejected at upload time, or downloaded as an attachment (never inline).
+_ALLOWED_MIME_TYPES: frozenset[str] = frozenset({
+    "application/pdf",
+    "image/jpeg",
+    "image/png",
+    "image/tiff",
+})
+_INLINE_SAFE_MIME_TYPES: frozenset[str] = _ALLOWED_MIME_TYPES  # never `image/svg+xml`, never html
+
+_FILENAME_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _sanitize_filename(name: str | None) -> str:
+    """Reduce filename to a safe ASCII slug.  Used for both storage keys and
+    Content-Disposition.  Empty/invalid input falls back to `file.bin`."""
+    if not name:
+        return "file.bin"
+    base = os.path.basename(name)            # drop any directory components
+    base = base.replace("\\", "_").replace("/", "_")
+    base = _FILENAME_SAFE_RE.sub("_", base)
+    base = base.strip("._") or "file.bin"
+    if len(base) > 120:
+        root, dot, ext = base.rpartition(".")
+        if dot:
+            base = root[: 120 - len(ext) - 1] + "." + ext
+        else:
+            base = base[:120]
+    return base
+
+
+def _enforce_upload_policy(content: bytes, declared_mime: str | None) -> str:
+    """Apply size + MIME policy to an uploaded blob.  Returns the trusted MIME.
+    Raises HTTPException on policy violation.
+
+    The browser-declared `content_type` is never trusted.  We require a magic-byte
+    match against the allow-list — every allowed type (PDF, JPEG, PNG, TIFF) has
+    a deterministic file-signature, so anything that fails to sniff is rejected.
+    This intentionally blocks SVG, HTML, scripts, and arbitrary blobs.
+    """
+    if len(content) == 0:
+        raise HTTPException(status_code=400, detail="Empty file")
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large (max {MAX_UPLOAD_BYTES // (1024 * 1024)} MiB)",
+        )
+    kind = filetype.guess(content)
+    sniffed = kind.mime if kind else None
+    if sniffed not in _ALLOWED_MIME_TYPES:
+        raise HTTPException(
+            status_code=415,
+            detail=(
+                "Unsupported file type. Allowed: PDF, JPEG, PNG, TIFF "
+                f"(declared={declared_mime!r}, detected={sniffed!r})"
+            ),
+        )
+    return sniffed
 
 
 class DocumentResponse(BaseModel):
@@ -95,9 +162,13 @@ async def upload_document(
     """Upload a document for a loan. Triggers classification pipeline."""
     loan = await _get_loan_or_404(loan_id, user, db)
 
-    # Read file
-    content = await file.read()
+    # Bounded read: refuse anything over MAX_UPLOAD_BYTES.  We read up to limit+1
+    # so we can distinguish "exactly at the limit" from "exceeded".
+    content = await file.read(MAX_UPLOAD_BYTES + 1)
+    trusted_mime = _enforce_upload_policy(content, file.content_type)
     file_hash = hashlib.sha256(content).hexdigest()
+
+    safe_name = _sanitize_filename(file.filename)
 
     # Check for duplicate
     existing_result = await db.execute(
@@ -118,12 +189,12 @@ async def upload_document(
             return _doc_to_response(existing_doc)
         raise HTTPException(status_code=409, detail="Duplicate document already uploaded")
 
-    # Store file to local filesystem (falls back gracefully from S3 when MinIO not running)
+    # Storage key uses only sanitized components — no client-controlled path segments.
     file_uid = uuid.uuid4()
-    s3_key = f"tenants/{user.tenant_id}/loans/{loan.id}/documents/{file_uid}/{file.filename}"
+    s3_key = f"tenants/{user.tenant_id}/loans/{loan.id}/documents/{file_uid}/{safe_name}"
     try:
         from ..shared.storage import LocalStorage
-        await LocalStorage("./storage").upload(s3_key, content, file.content_type or "application/octet-stream")
+        await LocalStorage("./storage").upload(s3_key, content, trusted_mime)
     except Exception as e:
         logger.warning("Storage upload failed (non-fatal): %s", e)
 
@@ -133,10 +204,10 @@ async def upload_document(
         borrower_id=borrower_id,
         document_type=document_type,
         file_path=s3_key,
-        file_name=file.filename or "unknown",
+        file_name=safe_name,
         file_size_bytes=len(content),
         file_hash=file_hash,
-        mime_type=file.content_type,
+        mime_type=trusted_mime,
         status=DocumentStatus.UPLOADED if not document_type else DocumentStatus.CLASSIFIED,
     )
     db.add(doc)
@@ -158,8 +229,8 @@ async def upload_document(
         str(doc.id),
         str(loan.id),
         content,
-        file.filename or "unknown",
-        file.content_type,
+        safe_name,
+        trusted_mime,
     )
 
     return _doc_to_response(doc)
@@ -204,11 +275,16 @@ async def download_document_file(
         logger.error("Failed to read file from storage: %s", e)
         raise HTTPException(status_code=500, detail="Failed to read file")
 
+    served_mime = (doc.mime_type or "application/octet-stream").lower()
+    safe_name = _sanitize_filename(doc.file_name)
+    disposition = "inline" if served_mime in _INLINE_SAFE_MIME_TYPES else "attachment"
     return Response(
         content=content,
-        media_type=doc.mime_type or "application/octet-stream",
+        media_type=served_mime,
         headers={
-            "Content-Disposition": f'inline; filename="{doc.file_name}"',
+            # RFC 5987-safe: filename is already ASCII-sanitized.
+            "Content-Disposition": f'{disposition}; filename="{safe_name}"',
+            "X-Content-Type-Options": "nosniff",
             "Cache-Control": "private, max-age=3600",
         },
     )

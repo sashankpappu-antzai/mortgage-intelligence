@@ -5,18 +5,23 @@ Provides the single-view dashboard data for underwriters.
 
 import uuid
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
+from jose import JWTError, jwt
 from pydantic import BaseModel
 from sqlalchemy import func, select
 
+from ..core.config import get_settings
 from ..dependencies import DB, CurrentUser
 from ..events.sse import subscribe_loan, subscribe_pipeline
 from ..db.models.agent_validation import AgentValidation
 from ..db.models.condition import Condition
 from ..db.models.document import Document
 from ..db.models.loan import Loan
-from ..shared.types import ConditionStatus, LoanStatus, ProcessingPhase, UserRole
+from ..db.models.user import User
+from ..shared.types import ConditionStatus, LoanStatus
+
+_sse_settings = get_settings()
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
@@ -240,23 +245,67 @@ async def get_loan_review(loan_id: uuid.UUID, user: CurrentUser, db: DB):
 
 
 # --- SSE Endpoints ---
+#
+# Browsers' EventSource cannot send Authorization headers, so SSE endpoints
+# accept the access token as a query parameter.  We verify it explicitly here
+# and look up the user — `Depends(get_current_user)` cannot be used because
+# the browser never sends the Bearer header.
+#
+# Channels are tenant-scoped: a subscriber only sees events for loans in their
+# own tenant, even though the loan_id space is global.
+
+
+async def _authenticate_sse(token: str, db: DB) -> User:
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing token")
+    try:
+        payload = jwt.decode(token, _sse_settings.jwt_secret_key, algorithms=[_sse_settings.jwt_algorithm])
+        user_id = payload.get("sub")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid token")
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    result = await db.execute(select(User).where(User.id == uuid.UUID(user_id), User.is_active.is_(True)))
+    user = result.scalar_one_or_none()
+    if user is None:
+        raise HTTPException(status_code=401, detail="User not found")
+    return user
+
+
+_SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",  # disable proxy buffering
+}
 
 
 @router.get("/events/pipeline")
-async def pipeline_events(user: CurrentUser):
-    """SSE stream for real-time pipeline updates (UW dashboard)."""
+async def pipeline_events(db: DB, token: str = Query(default="")):
+    """SSE stream for real-time pipeline updates, scoped to the caller's tenant."""
+    user = await _authenticate_sse(token, db)
     return StreamingResponse(
-        subscribe_pipeline(),
+        subscribe_pipeline(str(user.tenant_id)),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        headers=_SSE_HEADERS,
     )
 
 
 @router.get("/events/loan/{loan_id}")
-async def loan_events(loan_id: str, user: CurrentUser):
-    """SSE stream for real-time loan-specific updates."""
+async def loan_events(loan_id: uuid.UUID, db: DB, token: str = Query(default="")):
+    """SSE stream for real-time loan-specific updates.  Caller must belong to
+    the loan's tenant — otherwise we return 404 (no enumeration)."""
+    user = await _authenticate_sse(token, db)
+
+    result = await db.execute(
+        select(Loan).where(Loan.id == loan_id, Loan.tenant_id == user.tenant_id)
+    )
+    loan = result.scalar_one_or_none()
+    if loan is None:
+        raise HTTPException(status_code=404, detail="Loan not found")
+
     return StreamingResponse(
-        subscribe_loan(loan_id),
+        subscribe_loan(str(user.tenant_id), str(loan.id)),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        headers=_SSE_HEADERS,
     )

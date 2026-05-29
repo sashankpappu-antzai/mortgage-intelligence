@@ -19,7 +19,7 @@ databases:
   - name: mortgage-intelligence-db
     databaseName: mortgage_intelligence
     user: mortgage_intelligence
-    plan: starter           # $7/mo — required so the DB persists past 90 days
+    plan: basic-256mb       # ~$6/mo — smallest non-free Render Postgres tier (persists indefinitely)
     region: oregon
     postgresMajorVersion: "16"
 

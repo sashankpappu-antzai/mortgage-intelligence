@@ -1,0 +1,71 @@
+# Production-style docker-compose for a single-VM trial deploy.
+#
+# Differences vs docker-compose.yml (dev):
+#   - No source bind-mounts.  Code is baked into the image.
+#   - Frontend runs the standalone production build (not `npm run dev`).
+#   - Postgres bound to 127.0.0.1 only — never exposed to the public internet.
+#   - No MinIO / Langfuse / ngrok profiles — bring your own object store + LLM.
+#   - Reads ./.env.prod (NOT the dev .env).
+#
+# Usage (on the remote server):
+#   cp infra/.env.prod.example infra/.env.prod
+#   $EDITOR infra/.env.prod        # fill in secrets — see comments inside
+#   docker compose -f infra/docker-compose.prod.yml --env-file infra/.env.prod up -d --build
+#
+# To update after a code change:
+#   git pull && docker compose -f infra/docker-compose.prod.yml --env-file infra/.env.prod up -d --build
+
+services:
+  backend:
+    build:
+      context: ..
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    expose:
+      - "8000"
+    ports:
+      - "127.0.0.1:8000:8000"     # localhost only; expose via your reverse proxy
+    env_file:
+      - .env.prod
+    environment:
+      PORT: "8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - backend_storage:/app/storage   # only used if STORAGE_PROVIDER=local
+
+  frontend:
+    build:
+      context: ..
+      dockerfile: frontend/Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"     # localhost only; expose via your reverse proxy
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
+    depends_on:
+      - backend
+
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "127.0.0.1:5432:5432"     # localhost only
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:
+  backend_storage:
